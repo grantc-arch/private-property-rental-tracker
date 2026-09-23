@@ -185,6 +185,16 @@ def matches_type(listing: dict) -> bool:
     return any(keyword in type_text for keyword in ALLOWED_TYPE_KEYWORDS)
 
 
+def classify_category(listing: dict) -> str | None:
+    """Splits studio/bachelor from 1-bedroom so their medians don't mix."""
+    type_text = f"{listing['title']} {listing['beds']}".lower()
+    if "studio" in type_text or "bachelor" in type_text:
+        return "Studio"
+    if "1 bedroom" in type_text:
+        return "1 Bed"
+    return None
+
+
 def matches_filters(listing: dict) -> bool:
     price = parse_price_to_int(listing["price"])
     if price is None or price > MAX_PRICE:
@@ -236,23 +246,32 @@ def save_seen(seen: set[str]) -> None:
 
 # --- Telegram ------------------------------------------------------------------
 
-def send_telegram_alert(listing: dict, median: int | None) -> None:
+def send_telegram_alert(listing: dict, category_stats: dict) -> None:
     price = parse_price_to_int(listing["price"])
+    category = classify_category(listing)
+    stats = category_stats.get(category) if category else None
 
+    comparison_block = ""
     scale_block = ""
-    if median is not None and price is not None:
-        scale_line = render_price_scale(price, median)
-        scale_block = (
-            f"\n`{scale_line}`\n"
-            f"● this listing (R{price:,})   ▲ median (R{median:,})\n"
+    if stats and price is not None:
+        median, count = stats["median"], stats["count"]
+        pct = round(((price - median) / median) * 100)
+        direction = "below" if pct < 0 else "above"
+        comparison_block = (
+            f"R{price:,} is {abs(pct)}% {direction} the median {category} "
+            f"(R{median:,}, {count} listings)\n"
         )
+
+        scale_line = render_price_scale(price, median)
+        scale_block = f"`{scale_line}`\n"
 
     message = (
         f"🏠 New PrivateProperty listing in Stellenbosch\n\n"
         f"{listing['title']}\n"
         f"📍 {listing['address']}\n"
         f"💰 {listing['price']}\n"
-        f"🛏️ {listing['beds']}\n"
+        f"🛏️ {listing['beds']}\n\n"
+        f"{comparison_block}"
         f"{scale_block}\n"
         f"{listing['url']}"
     )
@@ -290,17 +309,25 @@ async def main():
     filtered = [l for l in listings if matches_filters(l)]
     print(f"Parsed {len(listings)} listings, {len(filtered)} match filters (≤R{MAX_PRICE}, 1-bed/studio/bachelor).")
 
-    # Median across ALL 1-bed/studio/bachelor listings this run (not just the
-    # ones under MAX_PRICE), so it reflects the real market, not a pre-filtered
-    # slice — the alert is comparing "this listing" against "the market", not
-    # against other cheap listings.
-    same_type_prices = [
-        p for l in listings
-        if matches_type(l) and (p := parse_price_to_int(l["price"])) is not None
-    ]
-    median = compute_median(same_type_prices)
-    if median is not None:
-        print(f"Median 1-bed/studio/bachelor price this run: R{median:,} (n={len(same_type_prices)})")
+    # Median computed PER CATEGORY (Studio/Bachelor vs 1 Bed) across ALL
+    # matching listings this run (not just the ones under MAX_PRICE), so it
+    # reflects the real market for that specific unit type, not a
+    # pre-filtered slice or a blended studio+1bed number.
+    prices_by_category: dict[str, list[int]] = {"Studio": [], "1 Bed": []}
+    for l in listings:
+        category = classify_category(l)
+        if category is None:
+            continue
+        price = parse_price_to_int(l["price"])
+        if price is not None:
+            prices_by_category[category].append(price)
+
+    category_stats = {}
+    for category, prices in prices_by_category.items():
+        median = compute_median(prices)
+        if median is not None:
+            category_stats[category] = {"median": median, "count": len(prices)}
+            print(f"Median {category} price this run: R{median:,} (n={len(prices)})")
 
     seen = load_seen()
     new_listings = [l for l in filtered if l["id"] not in seen]
@@ -308,7 +335,7 @@ async def main():
     print(f"{len(new_listings)} new.")
 
     for listing in new_listings:
-        send_telegram_alert(listing, median)
+        send_telegram_alert(listing, category_stats)
         seen.add(listing["id"])
 
     save_seen(seen)
