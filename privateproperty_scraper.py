@@ -57,9 +57,22 @@ async def fetch_html(url: str) -> str:
             )
         )
         await page.goto(url, wait_until="networkidle", timeout=30000)
-        # PrivateProperty may lazy-load cards on scroll — nudge it.
+        # PrivateProperty may lazy-load cards/prices on scroll — nudge it.
         await page.mouse.wheel(0, 3000)
-        await page.wait_for_timeout(1500)
+        try:
+            # Wait specifically for a price element to actually have text,
+            # since it can render slightly after the rest of the card.
+            await page.wait_for_selector(".listing-result-price", timeout=10000)
+            await page.wait_for_function(
+                """() => {
+                    const el = document.querySelector('.listing-result-price');
+                    return el && el.textContent.trim().length > 0;
+                }""",
+                timeout=10000,
+            )
+        except Exception as e:
+            print(f"Price element wait timed out (continuing anyway): {e}")
+        await page.wait_for_timeout(1000)
         html = await page.content()
         await browser.close()
         return html
