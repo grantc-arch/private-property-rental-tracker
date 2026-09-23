@@ -5,6 +5,9 @@ on:
     - cron: "0 * * * *"  # hourly, same cadence as the Property24 bot
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
