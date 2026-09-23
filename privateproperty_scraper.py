@@ -131,13 +131,46 @@ def parse_price_to_int(price_text: str) -> int | None:
     return int(digits) if digits else None
 
 
+def matches_type(listing: dict) -> bool:
+    type_text = f"{listing['title']} {listing['beds']}".lower()
+    return any(keyword in type_text for keyword in ALLOWED_TYPE_KEYWORDS)
+
+
 def matches_filters(listing: dict) -> bool:
     price = parse_price_to_int(listing["price"])
     if price is None or price > MAX_PRICE:
         return False
+    return matches_type(listing)
 
-    type_text = f"{listing['title']} {listing['beds']}".lower()
-    return any(keyword in type_text for keyword in ALLOWED_TYPE_KEYWORDS)
+
+def compute_median(prices: list[int]) -> int | None:
+    if not prices:
+        return None
+    ordered = sorted(prices)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) // 2
+
+
+def render_price_scale(price: int, median: int, scale_max: int = 20000, width: int = 26) -> str:
+    """R0 ───────────●─▲────────── R20k
+    ● = this listing   ▲ = median
+    Both markers clamp into the bar if the price exceeds scale_max."""
+    def position(value: int) -> int:
+        clamped = max(0, min(value, scale_max))
+        return round((clamped / scale_max) * (width - 1))
+
+    price_pos = position(price)
+    median_pos = position(median)
+
+    bar = ["─"] * width
+    # Median first so the listing marker wins if they land on the same spot.
+    bar[median_pos] = "▲"
+    bar[price_pos] = "●"
+
+    scale_line = f"R0 {''.join(bar)} R{scale_max // 1000}k"
+    return scale_line
 
 
 # --- Dedup / state ------------------------------------------------------------
@@ -154,18 +187,34 @@ def save_seen(seen: set[str]) -> None:
 
 # --- Telegram ------------------------------------------------------------------
 
-def send_telegram_alert(listing: dict) -> None:
+def send_telegram_alert(listing: dict, median: int | None) -> None:
+    price = parse_price_to_int(listing["price"])
+
+    scale_block = ""
+    if median is not None and price is not None:
+        scale_line = render_price_scale(price, median)
+        scale_block = (
+            f"\n`{scale_line}`\n"
+            f"● this listing (R{price:,})   ▲ median (R{median:,})\n"
+        )
+
     message = (
         f"🏠 New PrivateProperty listing in Stellenbosch\n\n"
         f"{listing['title']}\n"
         f"📍 {listing['address']}\n"
         f"💰 {listing['price']}\n"
-        f"🛏️ {listing['beds']}\n\n"
+        f"🛏️ {listing['beds']}\n"
+        f"{scale_block}\n"
         f"{listing['url']}"
     )
     resp = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False},
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": False,
+            "parse_mode": "Markdown",
+        },
         timeout=15,
     )
     if not resp.ok:
@@ -185,13 +234,25 @@ async def main():
     filtered = [l for l in listings if matches_filters(l)]
     print(f"Parsed {len(listings)} listings, {len(filtered)} match filters (≤R{MAX_PRICE}, 1-bed/studio/bachelor).")
 
+    # Median across ALL 1-bed/studio/bachelor listings this run (not just the
+    # ones under MAX_PRICE), so it reflects the real market, not a pre-filtered
+    # slice — the alert is comparing "this listing" against "the market", not
+    # against other cheap listings.
+    same_type_prices = [
+        p for l in listings
+        if matches_type(l) and (p := parse_price_to_int(l["price"])) is not None
+    ]
+    median = compute_median(same_type_prices)
+    if median is not None:
+        print(f"Median 1-bed/studio/bachelor price this run: R{median:,} (n={len(same_type_prices)})")
+
     seen = load_seen()
     new_listings = [l for l in filtered if l["id"] not in seen]
 
     print(f"{len(new_listings)} new.")
 
     for listing in new_listings:
-        send_telegram_alert(listing)
+        send_telegram_alert(listing, median)
         seen.add(listing["id"])
 
     save_seen(seen)
