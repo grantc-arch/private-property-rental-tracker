@@ -60,16 +60,10 @@ async def fetch_html(url: str) -> str:
         # PrivateProperty may lazy-load cards/prices on scroll — nudge it.
         await page.mouse.wheel(0, 3000)
         try:
-            # Wait specifically for a price element to actually have text,
-            # since it can render slightly after the rest of the card.
-            await page.wait_for_selector(".listing-result-price", timeout=10000)
-            await page.wait_for_function(
-                """() => {
-                    const el = document.querySelector('.listing-result-price');
-                    return el && el.textContent.trim().length > 0;
-                }""",
-                timeout=10000,
-            )
+            # "attached" (in the DOM) rather than "visible" — lazy-rendered
+            # cards may never register as visible in a headless run even
+            # once their content is present.
+            await page.wait_for_selector(".listing-result-price", state="attached", timeout=10000)
         except Exception as e:
             print(f"Price element wait timed out (continuing anyway): {e}")
         await page.wait_for_timeout(1000)
@@ -100,6 +94,16 @@ def parse_listings(html: str) -> list[dict]:
             listing_id = listing_id_match.group(1) if listing_id_match else href
 
             price_el = card.select_one(".listing-result-price")
+            price_text = price_el.get_text(strip=True) if price_el else ""
+
+            # Fallback: scan the whole card's text for an "R 12 345" style
+            # pattern, in case the specific price class isn't populated
+            # (e.g. lazy-rendered content not fully captured in this run).
+            if not price_text:
+                card_text = card.get_text(" ", strip=True)
+                price_match = re.search(r"R\s?[\d\s,]{3,}", card_text)
+                price_text = price_match.group(0).strip() if price_match else "Price on request"
+
             title_el = card.select_one(".listing-result-title")
             address_el = card.select_one(".listing-result-address")
 
@@ -112,7 +116,7 @@ def parse_listings(html: str) -> list[dict]:
                 "id": listing_id,
                 "url": href,
                 "title": title_el.get_text(strip=True) if title_el else (title_attr or "Untitled listing"),
-                "price": price_el.get_text(strip=True) if price_el else "Price on request",
+                "price": price_text,
                 "beds": title_attr or "Beds not listed",
                 "address": address_el.get_text(strip=True) if address_el else "Stellenbosch",
             })
