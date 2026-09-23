@@ -169,6 +169,12 @@ async def main():
         print("No listings parsed — PrivateProperty may have changed their markup, or the page didn't fully load.")
         return
 
+    # Temporary debug — shows what's actually on the page before filters cut it down.
+    print("--- All parsed listings (pre-filter) ---")
+    for l in listings:
+        print(f"  {l['price']:>15} | {l['title']}")
+    print("-----------------------------------------")
+
     filtered = [l for l in listings if matches_filters(l)]
     print(f"Parsed {len(listings)} listings, {len(filtered)} match filters (≤R{MAX_PRICE}, 1-bed/studio/bachelor).")
 
