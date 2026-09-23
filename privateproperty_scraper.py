@@ -43,6 +43,11 @@ MAX_PRICE = 12000
 # studios either way.
 ALLOWED_TYPE_KEYWORDS = ["1 bedroom", "bachelor", "studio"]
 
+# How many result pages to walk through. 81 results / 20 per page ≈ 5 pages
+# for the current market size — bump this up if Stellenbosch Central's
+# listing count grows a lot.
+MAX_PAGES = 6
+
 SEEN_FILE = Path("seen_privateproperty.json")
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -50,7 +55,26 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # --- Fetch ------------------------------------------------------------------
 
-async def fetch_html(url: str) -> str:
+# NOTE: pagination is done by clicking a "Next" control rather than guessing
+# a URL query parameter — PrivateProperty's pagination param name hasn't been
+# confirmed, and a wrong guess would silently return page 1 over and over
+# with no error. These candidate selectors are reasonable guesses for a
+# "next page" control; if pagination isn't actually advancing (you'll see
+# "no next-page control found, stopping" in the log after page 1), open the
+# search results page, inspect the pagination controls at the bottom, and
+# send me a screenshot so I can swap in the real selector.
+NEXT_PAGE_SELECTORS = [
+    'a[rel="next"]',
+    'a[aria-label="Next"]',
+    'button[aria-label="Next"]',
+    'a:has-text("Next")',
+    'button:has-text("Next")',
+    'li.pagination-next a',
+]
+
+
+async def fetch_all_html(url: str, max_pages: int = MAX_PAGES) -> list[str]:
+    htmls = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(
@@ -60,12 +84,37 @@ async def fetch_html(url: str) -> str:
             )
         )
         await page.goto(url, wait_until="networkidle", timeout=30000)
-        # PrivateProperty lazy-renders some card content on scroll.
-        await page.mouse.wheel(0, 3000)
-        await page.wait_for_timeout(1500)
-        html = await page.content()
+
+        for page_num in range(1, max_pages + 1):
+            # PrivateProperty lazy-renders some card content on scroll.
+            await page.mouse.wheel(0, 3000)
+            await page.wait_for_timeout(1500)
+            htmls.append(await page.content())
+            print(f"Fetched page {page_num}.")
+
+            if page_num == max_pages:
+                break
+
+            next_button = None
+            for selector in NEXT_PAGE_SELECTORS:
+                candidate = page.locator(selector).first
+                if await candidate.count() > 0:
+                    next_button = candidate
+                    break
+
+            if next_button is None:
+                print("No next-page control found, stopping pagination.")
+                break
+
+            try:
+                await next_button.click()
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception as e:
+                print(f"Couldn't advance to next page, stopping pagination: {e}")
+                break
+
         await browser.close()
-        return html
+    return htmls
 
 
 # --- Parse -------------------------------------------------------------------
@@ -224,12 +273,19 @@ def send_telegram_alert(listing: dict, median: int | None) -> None:
 # --- Main -----------------------------------------------------------------
 
 async def main():
-    html = await fetch_html(SEARCH_URL)
-    listings = parse_listings(html)
+    htmls = await fetch_all_html(SEARCH_URL)
+
+    listings_by_id = {}
+    for html in htmls:
+        for listing in parse_listings(html):
+            listings_by_id[listing["id"]] = listing  # last-seen wins on dupes
+    listings = list(listings_by_id.values())
 
     if not listings:
         print("No listings parsed — PrivateProperty may have changed their markup, or the page didn't fully load.")
         return
+
+    print(f"Collected {len(listings)} unique listings across {len(htmls)} page(s).")
 
     filtered = [l for l in listings if matches_filters(l)]
     print(f"Parsed {len(listings)} listings, {len(filtered)} match filters (≤R{MAX_PRICE}, 1-bed/studio/bachelor).")
