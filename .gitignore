@@ -2,5 +2,4 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-seen_privateproperty.json
 .env
