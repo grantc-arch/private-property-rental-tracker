@@ -3,14 +3,15 @@ PrivateProperty.co.za rental watcher — Stellenbosch
 Same architecture as the Property24 bot: Playwright fetch -> BeautifulSoup parse
 -> diff against seen.json -> Telegram alert for new listings.
 
-IMPORTANT: PrivateProperty's HTML structure has NOT been verified live in this
-build (their search pages weren't reachable via search/fetch when this was
-written). Before running this for real:
-  1. Open the search URL below in a browser.
-  2. Right-click a listing card -> Inspect.
-  3. Update the CSS selectors marked "# CONFIRM" to match what you see.
-Everything else (dedup logic, Telegram alerting, GitHub Actions schedule)
-should work unchanged once the selectors are correct.
+Selectors confirmed against live markup (Sept 2026):
+  card    -> a.listing-result  (href, title attr both usable)
+  price   -> .listing-result-price
+  title   -> .listing-result-title
+  address -> .listing-result-address
+  id      -> reference number in the href, e.g. .../RR4775153
+
+If PrivateProperty changes their markup later, re-inspect a live listing card
+(right-click -> Inspect) and update the selectors below.
 """
 
 import asyncio
@@ -25,9 +26,19 @@ import requests
 
 # --- Config ---------------------------------------------------------------
 
-# Adjust suburb/price/bedroom filters as needed via PrivateProperty's own
-# search UI, then copy the resulting URL here (sorted by newest if possible).
-SEARCH_URL = "https://www.privateproperty.co.za/to-rent/western-cape/stellenbosch/9/8016"
+# Stellenbosch Central, sorted newest first (same pattern as the Property24 bot).
+SEARCH_URL = (
+    "https://www.privateproperty.co.za/to-rent/western-cape/boland/stellenbosch/"
+    "stellenbosch-central/412?sorttype=Date&sortorder=Descending"
+)
+
+# Filters applied in code (not via URL params, which aren't confirmed to work
+# reliably on PrivateProperty). A listing must pass ALL of these to alert.
+MAX_PRICE = 12000
+# Matched against the listing's title text, case-insensitive. Covers "1
+# Bedroom", "Bachelor" and "Studio" flats — PrivateProperty tends to label
+# studios either way.
+ALLOWED_TYPE_KEYWORDS = ["1 bedroom", "bachelor", "studio"]
 
 SEEN_FILE = Path("seen_privateproperty.json")
 
@@ -60,35 +71,36 @@ def parse_listings(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     listings = []
 
-    # CONFIRM: container for each listing card. Common PP patterns are
-    # div[data-testid="listing-result"] or similar — check real markup.
-    cards = soup.select('[data-testid*="listing"]')  # CONFIRM
+    # Each listing is an <a class="listing-result" title="..." href="...">
+    cards = soup.select("a.listing-result")
 
     for card in cards:
         try:
-            # CONFIRM each of these selectors against the real DOM
-            link_el = card.select_one("a")
-            title_el = card.select_one('[data-testid*="title"]') or card.select_one("h3")
-            price_el = card.select_one('[data-testid*="price"]')
-            beds_el = card.select_one('[data-testid*="bedroom"]')
-            address_el = card.select_one('[data-testid*="address"]') or card.select_one("address")
-
-            if not link_el or not link_el.get("href"):
+            href = card.get("href", "")
+            if not href:
                 continue
-
-            href = link_el["href"]
             if href.startswith("/"):
                 href = "https://www.privateproperty.co.za" + href
 
-            listing_id_match = re.search(r"(\d{5,})", href)
+            # Reference number in the URL, e.g. .../RR4775153
+            listing_id_match = re.search(r"(RR\d+)", href)
             listing_id = listing_id_match.group(1) if listing_id_match else href
+
+            price_el = card.select_one(".listing-result-price")
+            title_el = card.select_one(".listing-result-title")
+            address_el = card.select_one(".listing-result-address")
+
+            # Bedroom count isn't in a dedicated class in this markup — it's
+            # in the feature icons block. Fall back to the title attr, which
+            # usually includes it (e.g. "2 Bedroom Apartment").
+            title_attr = card.get("title", "")
 
             listings.append({
                 "id": listing_id,
                 "url": href,
-                "title": title_el.get_text(strip=True) if title_el else "Untitled listing",
+                "title": title_el.get_text(strip=True) if title_el else (title_attr or "Untitled listing"),
                 "price": price_el.get_text(strip=True) if price_el else "Price on request",
-                "beds": beds_el.get_text(strip=True) if beds_el else "Beds not listed",
+                "beds": title_attr or "Beds not listed",
                 "address": address_el.get_text(strip=True) if address_el else "Stellenbosch",
             })
         except Exception as e:
@@ -96,6 +108,23 @@ def parse_listings(html: str) -> list[dict]:
             continue
 
     return listings
+
+
+# --- Filtering ---------------------------------------------------------------
+
+def parse_price_to_int(price_text: str) -> int | None:
+    """'R 11 500 per month' -> 11500. Returns None if unparseable."""
+    digits = re.sub(r"[^\d]", "", price_text)
+    return int(digits) if digits else None
+
+
+def matches_filters(listing: dict) -> bool:
+    price = parse_price_to_int(listing["price"])
+    if price is None or price > MAX_PRICE:
+        return False
+
+    type_text = f"{listing['title']} {listing['beds']}".lower()
+    return any(keyword in type_text for keyword in ALLOWED_TYPE_KEYWORDS)
 
 
 # --- Dedup / state ------------------------------------------------------------
@@ -137,13 +166,16 @@ async def main():
     listings = parse_listings(html)
 
     if not listings:
-        print("No listings parsed — selectors likely need updating (see CONFIRM comments).")
+        print("No listings parsed — PrivateProperty may have changed their markup, or the page didn't fully load.")
         return
 
-    seen = load_seen()
-    new_listings = [l for l in listings if l["id"] not in seen]
+    filtered = [l for l in listings if matches_filters(l)]
+    print(f"Parsed {len(listings)} listings, {len(filtered)} match filters (≤R{MAX_PRICE}, 1-bed/studio/bachelor).")
 
-    print(f"Parsed {len(listings)} listings, {len(new_listings)} new.")
+    seen = load_seen()
+    new_listings = [l for l in filtered if l["id"] not in seen]
+
+    print(f"{len(new_listings)} new.")
 
     for listing in new_listings:
         send_telegram_alert(listing)
