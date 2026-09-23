@@ -1,8 +1,7 @@
 # PrivateProperty Rental Watcher — Stellenbosch
 
 Automated rental listing watcher for PrivateProperty.co.za, scoped to Stellenbosch.
-Built on the same architecture as an existing Property24 watcher: Playwright fetch ->
-BeautifulSoup parse -> dedupe against a seen-listings file -> Telegram alert on anything new.
+Playwright fetch -> BeautifulSoup parse -> dedupe against a seen-listings file -> Telegram alert on anything new.
 Runs on a schedule via GitHub Actions, no server required.
 
 ## Status
