@@ -5,10 +5,13 @@ Same architecture as the Property24 bot: Playwright fetch -> BeautifulSoup parse
 
 Selectors confirmed against live markup (Sept 2026):
   card    -> a.listing-result  (href, title attr both usable)
-  price   -> .listing-result-price
   title   -> .listing-result-title
   address -> .listing-result-address
   id      -> reference number in the href, e.g. .../RR4775153
+  price   -> .listing-result-price doesn't reliably populate in a headless
+             run, so price is extracted via regex over the card's raw text
+             instead (looks for an "R 12 345" style pattern). Confirmed
+             working against live listings.
 
 If PrivateProperty changes their markup later, re-inspect a live listing card
 (right-click -> Inspect) and update the selectors below.
@@ -57,16 +60,9 @@ async def fetch_html(url: str) -> str:
             )
         )
         await page.goto(url, wait_until="networkidle", timeout=30000)
-        # PrivateProperty may lazy-load cards/prices on scroll — nudge it.
+        # PrivateProperty lazy-renders some card content on scroll.
         await page.mouse.wheel(0, 3000)
-        try:
-            # "attached" (in the DOM) rather than "visible" — lazy-rendered
-            # cards may never register as visible in a headless run even
-            # once their content is present.
-            await page.wait_for_selector(".listing-result-price", state="attached", timeout=10000)
-        except Exception as e:
-            print(f"Price element wait timed out (continuing anyway): {e}")
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1500)
         html = await page.content()
         await browser.close()
         return html
@@ -185,12 +181,6 @@ async def main():
     if not listings:
         print("No listings parsed — PrivateProperty may have changed their markup, or the page didn't fully load.")
         return
-
-    # Temporary debug — shows what's actually on the page before filters cut it down.
-    print("--- All parsed listings (pre-filter) ---")
-    for l in listings:
-        print(f"  {l['price']:>15} | {l['title']}")
-    print("-----------------------------------------")
 
     filtered = [l for l in listings if matches_filters(l)]
     print(f"Parsed {len(listings)} listings, {len(filtered)} match filters (≤R{MAX_PRICE}, 1-bed/studio/bachelor).")
